@@ -2,10 +2,14 @@ import boto3
 import json
 import sys
 import os
+from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from datetime import datetime
 import re
 from medical_safety import MedicalSafetyGuardrails
+
+# Load environment variables
+load_dotenv()
 
 class SmartMedicalSearchGlucoMate:
     def __init__(self):
@@ -15,24 +19,22 @@ class SmartMedicalSearchGlucoMate:
         self.safety = MedicalSafetyGuardrails()
         self.model_id = "amazon.titan-text-premier-v1:0"
         
-        # Your Knowledge Base ID
-        self.knowledge_base_id = "JX4DNBIXAA"
-        
-        # Google Custom Search Configuration
-        # TODO: Replace with your actual API key and Search Engine ID
+        # Get credentials from environment variables
         self.google_api_key = os.getenv('GOOGLE_API_KEY')
-        self.search_engine_id = "930f2df31ce9c4058"
+        self.search_engine_id = os.getenv('SEARCH_ENGINE_ID')
+        self.knowledge_base_id = os.getenv('KNOWLEDGE_BASE_ID', 'GXJOYBIHCU')
         
         # Initialize Google Search
         try:
-            if self.google_api_key != os.getenv('GOOGLE_API_KEY'):
+            if self.google_api_key:
                 self.search_service = build("customsearch", "v1", developerKey=self.google_api_key)
+                print("🔍 Connected to trusted medical sources")
             else:
                 self.search_service = None
-                print("⚠️ Google Search not configured - using Knowledge Base only")
+                print("💭 Using knowledge base only")
         except Exception as e:
-            print(f"⚠️ Google Search setup failed: {e}")
             self.search_service = None
+            print("💭 Search temporarily unavailable - using medical knowledge base")
         
         # Supported languages
         self.supported_languages = {
@@ -43,79 +45,78 @@ class SmartMedicalSearchGlucoMate:
             '5': ('Portuguese', 'pt'),
             '6': ('German', 'de')
         }
-    
-    def classify_query_type(self, question):
-        """Classify if question needs current info or can use Knowledge Base"""
-        current_info_keywords = [
-            "latest", "recent", "new", "current", "2024", "2025", "newest",
-            "updated", "breakthrough", "trial", "study", "research", 
-            "medication approved", "guidelines updated", "news"
+        
+        # Warm, human conversation starters
+        self.conversation_starters = [
+            "I understand you're looking for information about",
+            "Let me help you with that question about",
+            "That's a great question about",
+            "I'm here to help you understand",
+            "Let me share what I know about"
         ]
         
-        question_lower = question.lower()
-        needs_current_info = any(keyword in question_lower for keyword in current_info_keywords)
-        
-        return "current" if needs_current_info else "knowledge_base"
+        # Encouraging phrases
+        self.encouragement = [
+            "You're taking a positive step by learning about your health!",
+            "It's wonderful that you're being proactive about your diabetes care.",
+            "Taking control of your diabetes is empowering - you're on the right track!",
+            "Every small step towards better health matters.",
+            "You're not alone in this journey - many people successfully manage diabetes."
+        ]
+    
+    def classify_query_type(self, question):
+        """Classify if question needs current info"""
+        current_keywords = ["latest", "recent", "new", "current", "2024", "2025", "breakthrough", "study", "research", "approved"]
+        return "current" if any(kw in question.lower() for kw in current_keywords) else "knowledge_base"
     
     def search_trusted_medical_sources(self, query):
-        """Search only trusted medical websites using Google Custom Search"""
+        """Search trusted medical sources with better error handling"""
         if not self.search_service:
             return None
             
         try:
-            # Enhanced query for diabetes-specific medical information
             search_query = f"diabetes {query}"
-            
-            # Perform the search
-            result = self.search_service.cse().list(
-                q=search_query,
-                cx=self.search_engine_id,
-                num=5  # Get top 5 results
-            ).execute()
+            result = self.search_service.cse().list(q=search_query, cx=self.search_engine_id, num=5).execute()
             
             if 'items' in result:
                 return self.process_search_results(result['items'], query)
-            else:
-                return None
-                
+            return None
         except Exception as e:
-            print(f"Medical web search failed: {e}")
+            if "quota" in str(e).lower():
+                return "I've reached my daily search limit, but let me check my medical knowledge base for you."
             return None
     
     def process_search_results(self, results, original_query):
-        """Process search results and generate medical response"""
+        """Process search results with warmer tone"""
         try:
-            # Compile information from trusted sources
             compiled_info = []
             for result in results:
-                # Extract domain for source attribution
                 domain = result['link'].split('/')[2]
                 source_name = self.get_source_name(domain)
-                
                 compiled_info.append({
                     "title": result['title'],
                     "snippet": result['snippet'],
                     "source": source_name,
-                    "url": result['link'],
-                    "domain": domain
+                    "url": result['link']
                 })
             
-            # Use AI to synthesize information from trusted sources
+            # Create a warm, personalized synthesis prompt
             synthesis_prompt = f"""
-            Based on the following information from trusted medical sources, provide a comprehensive answer to: {original_query}
+            You are GlucoMate, a warm and caring diabetes companion. A person has asked: {original_query}
             
-            Search Results:
+            Based on these trusted medical sources:
             {json.dumps(compiled_info, indent=2)}
             
-            Guidelines:
-            1. Synthesize information from all sources
-            2. Highlight any new or updated information
-            3. Maintain medical accuracy and caution
-            4. Focus on diabetes-related information
-            5. If results are not directly relevant, say so
-            6. Be concise but comprehensive
+            Please respond in a warm, conversational, and supportive tone that:
+            1. Acknowledges their question with empathy
+            2. Provides clear, helpful information from the sources
+            3. Uses encouraging language
+            4. Includes practical tips they can actually use
+            5. Shows you care about their wellbeing
+            6. Sounds like a knowledgeable friend, not a medical textbook
+            7. Keeps medical accuracy while being warm and personal
             
-            Provide a medical response based on these trusted sources:
+            Start with a caring acknowledgment, then provide the helpful information in a conversational way.
             """
             
             response = self.bedrock_client.invoke_model(
@@ -124,7 +125,7 @@ class SmartMedicalSearchGlucoMate:
                     "inputText": synthesis_prompt,
                     "textGenerationConfig": {
                         "maxTokenCount": 1500,
-                        "temperature": 0.1,
+                        "temperature": 0.3,  # Slightly higher for warmer responses
                         "topP": 0.9
                     }
                 }),
@@ -132,36 +133,32 @@ class SmartMedicalSearchGlucoMate:
             )
             
             response_body = json.loads(response['body'].read())
-            synthesized_answer = response_body['results'][0]['outputText']
+            answer = response_body['results'][0]['outputText']
             
-            # Add source citations
-            citations = "\n\n📚 **Trusted Medical Sources:**\n"
-            for info in compiled_info:
-                citations += f"• {info['source']} - {info['title'][:50]}...\n"
+            # Add warm source attribution
+            sources = f"\n\n💙 I found this information from trusted sources like {', '.join([info['source'] for info in compiled_info[:2]])}."
             
-            return synthesized_answer + citations
+            return answer + sources
             
         except Exception as e:
-            print(f"Error processing search results: {e}")
             return None
     
     def get_source_name(self, domain):
-        """Convert domain to readable source name"""
+        """Convert domain to friendly source names"""
         source_map = {
-            "diabetes.org": "American Diabetes Association",
-            "who.int": "World Health Organization",
-            "cdc.gov": "Centers for Disease Control",
-            "nih.gov": "National Institutes of Health",
-            "pubmed.ncbi.nlm.nih.gov": "PubMed Medical Research",
+            "diabetes.org": "the American Diabetes Association",
+            "who.int": "the World Health Organization",
+            "cdc.gov": "the CDC",
+            "nih.gov": "the National Institutes of Health",
+            "pubmed.ncbi.nlm.nih.gov": "medical research studies",
             "mayoclinic.org": "Mayo Clinic",
             "clevelandclinic.org": "Cleveland Clinic",
-            "joslin.org": "Joslin Diabetes Center",
-            "endocrine.org": "Endocrine Society"
+            "joslin.org": "Joslin Diabetes Center"
         }
         return source_map.get(domain, domain)
     
     def query_medical_knowledge(self, question):
-        """Query the diabetes knowledge base"""
+        """Query knowledge base with warmer processing"""
         try:
             response = self.bedrock_agent.retrieve_and_generate(
                 input={'text': question},
@@ -174,176 +171,198 @@ class SmartMedicalSearchGlucoMate:
                 }
             )
             
-            answer = response['output']['text']
-            sources = response.get('citations', [])
+            raw_answer = response['output']['text']
             
-            if sources:
-                source_info = "\n\n📚 **Knowledge Base Sources**: Medical guidelines and evidence-based literature."
-                answer += source_info
+            # Make the knowledge base response warmer
+            warm_prompt = f"""
+            Take this medical information and rewrite it in a warm, caring, conversational tone:
             
-            return answer
+            {raw_answer}
+            
+            Make it sound like a knowledgeable friend who cares about the person's wellbeing. Keep all the medical accuracy but make it:
+            - More personal and encouraging
+            - Less clinical and robotic
+            - Include practical tips
+            - Show empathy and understanding
+            - Use "you" and "your" to make it personal
+            """
+            
+            warm_response = self.bedrock_client.invoke_model(
+                modelId=self.model_id,
+                body=json.dumps({
+                    "inputText": warm_prompt,
+                    "textGenerationConfig": {
+                        "maxTokenCount": 1200,
+                        "temperature": 0.4,
+                        "topP": 0.9
+                    }
+                }),
+                contentType='application/json'
+            )
+            
+            warm_body = json.loads(warm_response['body'].read())
+            friendly_answer = warm_body['results'][0]['outputText']
+            
+            return friendly_answer + "\n\n💙 This information comes from medical guidelines and evidence-based research."
             
         except Exception as e:
-            print(f"Knowledge base query failed: {e}")
+            if "ThrottlingException" in str(e):
+                return "I'm getting a lot of questions right now! Let me try to help you with what I know about diabetes management. What specific aspect would you like to know more about?"
+            elif "does not exist" in str(e):
+                return "I'm having trouble accessing my medical database right now, but I'd still love to help! Could you ask me something more specific about diabetes care?"
             return None
     
     def translate_to_english(self, text, source_language):
-        """Translate user input to English for processing"""
         if source_language == 'en':
             return text
-        
         try:
             response = self.translate_client.translate_text(
-                Text=text,
-                SourceLanguageCode=source_language,
-                TargetLanguageCode='en'
+                Text=text, SourceLanguageCode=source_language, TargetLanguageCode='en'
             )
             return response['TranslatedText']
-        except Exception as e:
+        except:
             return text
     
     def translate_response(self, text, target_language):
-        """Translate response back to user's language"""
         if target_language == 'en':
             return text
-        
         try:
             response = self.translate_client.translate_text(
-                Text=text,
-                SourceLanguageCode='en',
-                TargetLanguageCode=target_language,
-                Settings={'Formality': 'FORMAL'}
+                Text=text, SourceLanguageCode='en', TargetLanguageCode=target_language,
+                Settings={'Formality': 'INFORMAL'}  # More conversational
             )
             return response['TranslatedText']
-        except Exception as e:
+        except:
             return text
     
-    def smart_medical_chat(self, user_input, target_language_code):
-        """Smart medical chat with both Knowledge Base and trusted web search"""
+    def warm_medical_chat(self, user_input, target_language_code):
+        """Main chat function with warm, human responses"""
         
-        # Translate input to English for processing
+        # Translate to English for processing
         english_input = self.translate_to_english(user_input, target_language_code)
         
-        # Check for emergency situations first
+        # Check for emergencies first
         safety_check = self.safety.check_emergency_situation(english_input)
         
         if safety_check['is_emergency']:
-            emergency_msg = safety_check['message']
+            emergency_msg = "🚨 I'm really concerned about what you're describing. This sounds like it could be a medical emergency. Please call 911 or go to your nearest emergency room right away. Your safety is the most important thing right now."
             if target_language_code != 'en':
                 emergency_msg = self.translate_response(emergency_msg, target_language_code)
             return emergency_msg
         
-        # Classify query type
+        # Classify and respond
         query_type = self.classify_query_type(english_input)
         response = None
         
+        print("💭 Let me think about this...")
+        
         if query_type == "current" and self.search_service:
-            # For current information, search trusted medical sources first
-            print("🔍 Searching latest medical information from trusted sources...")
+            print("🔍 Checking the latest medical information for you...")
             web_response = self.search_trusted_medical_sources(english_input)
-            
             if web_response:
-                print("✅ Found current information from trusted medical sources")
-                response = web_response
-            else:
-                print("⚠️ Current info not found, checking knowledge base...")
-                kb_response = self.query_medical_knowledge(english_input)
-                response = kb_response
-        else:
-            # For general diabetes questions, use Knowledge Base first
-            print("🔍 Searching medical knowledge base...")
-            kb_response = self.query_medical_knowledge(english_input)
-            
-            if kb_response:
-                print("✅ Response from medical knowledge base")
-                response = kb_response
-            elif self.search_service:
-                print("🔍 Knowledge base insufficient, searching trusted medical sources...")
-                web_response = self.search_trusted_medical_sources(english_input)
+                print("✨ Found some current information from trusted sources!")
                 response = web_response
         
-        # Fallback response
         if not response:
-            response = "I apologize, but I couldn't find specific information about your question. Please consult your healthcare provider for personalized medical guidance."
+            print("📚 Looking through my medical knowledge...")
+            kb_response = self.query_medical_knowledge(english_input)
+            if kb_response:
+                print("💡 Found something helpful for you!")
+                response = kb_response
         
-        # Translate response if needed
+        # Fallback with encouragement
+        if not response:
+            fallbacks = [
+                f"I want to help you with your question about diabetes, but I don't have specific information on that topic right now. What I can tell you is that managing diabetes is very manageable with the right support and information. Could you ask me something more specific? I'm here to help! 💙",
+                f"That's an interesting question! While I don't have detailed information about that specific aspect, I'm here to support you in your diabetes journey. Is there something else about diabetes management, nutrition, or daily care that I can help you with? 🌟"
+            ]
+            response = fallbacks[0]
+        
+        # Add encouragement occasionally
+        if any(word in english_input.lower() for word in ['scared', 'worried', 'difficult', 'hard', 'confused']):
+            encouragement = "\n\n" + self.encouragement[hash(english_input) % len(self.encouragement)]
+            response = response + encouragement
+        
+        # Translate if needed
         if target_language_code != 'en':
             response = self.translate_response(response, target_language_code)
         
-        # Add comprehensive medical disclaimer
+        # Warm disclaimer
         disclaimer = f"""
 
-📋 **Medical Information Notice:**
-- Information from trusted medical organizations and research
-- Updated: {datetime.now().strftime('%Y-%m-%d')}
-- This is educational information only
-- Always consult your healthcare provider for personalized advice
-- In emergencies, call 911 immediately
+💙 **A caring reminder**: I'm here to provide educational support and encouragement, but I'm not a replacement for your healthcare team. For personalized medical advice, always check with your doctor or diabetes educator. In any emergency, please call 911 immediately.
 
-🏥 **Sources**: Knowledge Base + Trusted medical websites (ADA, WHO, CDC, NIH)"""
+🌟 **You've got this!** Managing diabetes is a journey, and I'm here to support you along the way."""
         
         if target_language_code != 'en':
             disclaimer = self.translate_response(disclaimer, target_language_code)
         
-        # Add warning if needed
+        # Add high-priority warnings with care
         if safety_check['urgency_level'] == 'HIGH':
-            warning_msg = safety_check['message']
+            warning = "💛 I'm a bit concerned about what you're describing. It would be really good to check in with your healthcare provider about this soon - they'll be able to give you the best guidance for your specific situation."
             if target_language_code != 'en':
-                warning_msg = self.translate_response(warning_msg, target_language_code)
-            response = warning_msg + "\n\n" + response
+                warning = self.translate_response(warning, target_language_code)
+            response = warning + "\n\n" + response
         
         return response + disclaimer
 
 def main():
-    print("🧠 GlucoMate with Smart Medical Search")
-    print("🏥 Knowledge Base + Trusted Medical Web Search")
-    print("🌍 Multilingual support available")
+    print("💙 Hello! I'm GlucoMate, your caring diabetes companion")
+    print("🌟 I'm here to support you with warmth, understanding, and reliable information")
+    print("✨ Together, we can make managing diabetes feel less overwhelming")
     
     bot = SmartMedicalSearchGlucoMate()
     
-    # Check configuration
-    if bot.search_service:
-        print("✅ Google Medical Search: Enabled")
-    else:
-        print("⚠️ Google Medical Search: Not configured (using Knowledge Base only)")
-        print("📋 To enable: Add your Google API key and Search Engine ID")
-    
-    print("\nChoose your language:")
+    print(f"\n🌍 I can chat with you in multiple languages!")
     for key, (lang_name, lang_code) in bot.supported_languages.items():
         flag_emoji = {'en': '🇺🇸', 'ar': '🇸🇦', 'fr': '🇫🇷', 'es': '🇪🇸', 'pt': '🇧🇷', 'de': '🇩🇪'}
         print(f"{key}. {flag_emoji.get(lang_code, '🌍')} {lang_name}")
     
     # Get language choice
     while True:
-        choice = input("\nEnter your choice (1-6): ").strip()
+        choice = input("\n💫 Which language feels most comfortable for you? (1-6): ").strip()
         if choice in bot.supported_languages:
             language_name, language_code = bot.supported_languages[choice]
             break
         else:
-            print("Invalid choice. Please enter 1-6.")
+            print("😊 Please choose a number between 1-6")
     
-    print(f"\n✅ Selected: {language_name}")
-    print("🩺 Ask me anything about diabetes!")
-    print("💡 Try: 'latest diabetes research' or 'new diabetes medications 2024'")
-    print("Type 'quit' to exit\n")
+    print(f"\n✨ Perfect! Let's chat in {language_name}")
+    
+    welcome_suggestions = [
+        "💭 'What should I know about managing my blood sugar?'",
+        "🍎 'What foods are good for diabetes?'",
+        "💪 'How can exercise help with diabetes?'",
+        "😌 'I'm feeling overwhelmed about my diagnosis'",
+        "🩺 'What should I ask my doctor at my next visit?'"
+    ]
+    
+    print("💙 I'm here to listen and help! You can ask me anything about diabetes.")
+    print("🌟 Here are some ways I can support you:")
+    for suggestion in welcome_suggestions:
+        print(f"   {suggestion}")
+    print("\n💬 What's on your mind today? (Type 'bye' when you're ready to go)")
     
     try:
         while True:
-            user_input = input("You: ").strip()
+            user_input = input("\n😊 You: ").strip()
             
-            if user_input.lower() in ['quit', 'exit', 'bye', 'stop']:
-                print("GlucoMate: Take care! Stay updated with diabetes care! 👋")
+            if user_input.lower() in ['quit', 'exit', 'bye', 'goodbye', 'stop']:
+                farewell = "💙 Take care of yourself! Remember, you're doing great by staying informed about your health. I'm always here when you need support. Wishing you all the best! 🌟"
+                if language_code != 'en':
+                    farewell = bot.translate_response(farewell, language_code)
+                print(f"\n💙 GlucoMate: {farewell}")
                 break
             
             if user_input:
-                response = bot.smart_medical_chat(user_input, language_code)
-                print(f"\n🩺 GlucoMate: {response}\n")
-                print("-" * 60)
+                response = bot.warm_medical_chat(user_input, language_code)
+                print(f"\n💙 GlucoMate: {response}")
+                print("\n" + "─" * 50)
             else:
-                print("Please enter a question or type 'quit' to exit.")
+                print("😊 I'm here whenever you're ready to chat!")
                 
     except KeyboardInterrupt:
-        print("\n\n🩺 GlucoMate: Goodbye! Stay healthy! 👋")
+        print("\n\n💙 GlucoMate: Take care! Remember, you're stronger than you know! 🌟")
 
 if __name__ == "__main__":
     main()
