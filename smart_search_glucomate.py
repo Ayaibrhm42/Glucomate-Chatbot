@@ -20,7 +20,7 @@ class SmartMedicalSearchGlucoMate:
         
         # Google Custom Search Configuration
         # TODO: Replace with your actual API key and Search Engine ID
-        self.google_api_key = "AIzaSyC3SfONtBhHZ18Od19a31Dn2uUbgK5wqsQ"
+        self.google_api_key = "os.getenv('GOOGLE_API_KEY')"
         self.search_engine_id = "930f2df31ce9c4058"
         
         # Initialize Google Search
