@@ -85,7 +85,7 @@ def main():
         user_input = input("You: ")
         
         if user_input.lower() in ['quit', 'exit', 'bye']:
-            print("GlucoMate: Take care! Remember to monitor your blood sugar regularly. 👋")
+            print("GlucoMate: Take care! Remember to monitor your blood sugar regularly. ")
             break
         
         if user_input.strip():
