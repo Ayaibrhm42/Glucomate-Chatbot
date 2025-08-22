@@ -28,13 +28,13 @@ class SmartMedicalSearchGlucoMate:
         try:
             if self.google_api_key:
                 self.search_service = build("customsearch", "v1", developerKey=self.google_api_key)
-                print("🔍 Connected to trusted medical sources")
+                print("Connected to trusted medical sources")
             else:
                 self.search_service = None
-                print("💭 Using knowledge base only")
+                print("Using knowledge base only")
         except Exception as e:
             self.search_service = None
-            print("💭 Search temporarily unavailable - using medical knowledge base")
+            print("Search temporarily unavailable - using medical knowledge base")
         
         # Supported languages
         self.supported_languages = {
@@ -55,21 +55,69 @@ class SmartMedicalSearchGlucoMate:
             "Let me share what I know about"
         ]
         
-        # Encouraging phrases
+        # Encouraging phrases (no emojis)
         self.encouragement = [
-            "You're taking a positive step by learning about your health!",
+            "You're taking a positive step by learning about your health.",
             "It's wonderful that you're being proactive about your diabetes care.",
-            "Taking control of your diabetes is empowering - you're on the right track!",
+            "Taking control of your diabetes is empowering - you're on the right track.",
             "Every small step towards better health matters.",
             "You're not alone in this journey - many people successfully manage diabetes."
         ]
     
     def classify_query_type(self, question):
-        """Classify if question needs current info"""
-        current_keywords = ["latest", "recent", "new", "current", "2024", "2025", "breakthrough", "study", "research", "approved"]
-        return "current" if any(kw in question.lower() for kw in current_keywords) else "knowledge_base"
+        """Classify the type of user input"""
+        question_lower = question.lower()
+        
+        # Simple classification - is it casual or medical?
+        casual_indicators = [
+            "hi", "hello", "hey", "how are you", "what's up", "thanks", "thank you",
+            "good morning", "good afternoon", "good evening", "bye", "goodbye",
+            "comment ça va", "ça va", "كيف حالك", "¿cómo estás"
+        ]
+        
+        medical_indicators = [
+            "diabetes", "blood sugar", "glucose", "insulin", "medication", "diet",
+            "exercise", "symptoms", "treatment", "doctor", "health", "medical"
+        ]
+        
+        # If it contains medical terms, treat as medical
+        if any(med_word in question_lower for med_word in medical_indicators):
+            current_keywords = ["latest", "recent", "new", "current", "2024", "2025", "breakthrough", "study", "research"]
+            if any(kw in question_lower for kw in current_keywords):
+                return "current_medical"
+            return "medical"
+        
+        # If it's clearly casual, treat as casual
+        if any(casual_word in question_lower for casual_word in casual_indicators):
+            return "casual"
+            
+        # If unclear, assume it might be medical (better safe than sorry)
+        return "medical"
     
-    def search_trusted_medical_sources(self, query):
+    def create_conversation_prompt(self, user_input, query_type, language="English"):
+        """Create appropriate prompts for different conversation types"""
+        
+        if query_type == "casual":
+            prompt = f"""You are GlucoMate, a friendly diabetes care assistant. Someone just said: "{user_input}"
+
+This seems like casual conversation, not a medical question. Respond naturally and conversationally, like a friendly person would. Keep it brief, warm, and natural. You can mention that you're here to help with diabetes questions, but don't make it sound scripted or robotic.
+
+Respond in {language} in a natural, conversational way:"""
+        
+        else:  # medical queries
+            prompt = f"""You are GlucoMate, a warm and caring diabetes companion. A person has asked: "{user_input}"
+
+Please respond in a warm, conversational, and supportive tone that:
+1. Provides accurate, evidence-based diabetes information
+2. Uses encouraging, friendly language
+3. Includes practical tips they can actually use
+4. Shows you care about their wellbeing
+5. Sounds like a knowledgeable friend, not a medical textbook
+6. Keeps medical accuracy while being warm and personal
+
+Respond in {language}:"""
+        
+        return prompt
         """Search trusted medical sources with better error handling"""
         if not self.search_service:
             return None
@@ -135,7 +183,7 @@ class SmartMedicalSearchGlucoMate:
             response_body = json.loads(response['body'].read())
             answer = response_body['results'][0]['outputText']
             
-            # Add warm source attribution
+            # Add clean source attribution
             sources = f"\n\n💙 I found this information from trusted sources like {', '.join([info['source'] for info in compiled_info[:2]])}."
             
             return answer + sources
@@ -236,7 +284,7 @@ class SmartMedicalSearchGlucoMate:
             return text
     
     def warm_medical_chat(self, user_input, target_language_code):
-        """Main chat function with warm, human responses"""
+        """Main chat function with natural conversation and medical responses"""
         
         # Translate to English for processing
         english_input = self.translate_to_english(user_input, target_language_code)
@@ -250,13 +298,32 @@ class SmartMedicalSearchGlucoMate:
                 emergency_msg = self.translate_response(emergency_msg, target_language_code)
             return emergency_msg
         
-        # Classify and respond
+        # Classify the type of input
         query_type = self.classify_query_type(english_input)
-        response = None
         
+        # Get language name for prompt
+        language_name = "English"
+        for code, (name, lang_code) in self.supported_languages.items():
+            if lang_code == target_language_code:
+                language_name = name
+                break
+        
+        # Handle casual conversation - use AI but no "thinking" messages
+        if query_type == "casual":
+            prompt = self.create_conversation_prompt(english_input, query_type, language_name)
+            response = self.call_bedrock_model(prompt)
+            
+            # Translate if needed
+            if target_language_code != 'en':
+                response = self.translate_response(response, target_language_code)
+            
+            return response
+        
+        # For medical queries, show thinking process and try knowledge sources
+        response = None
         print("💭 Let me think about this...")
         
-        if query_type == "current" and self.search_service:
+        if query_type == "current_medical" and self.search_service:
             print("🔍 Checking the latest medical information for you...")
             web_response = self.search_trusted_medical_sources(english_input)
             if web_response:
@@ -270,13 +337,11 @@ class SmartMedicalSearchGlucoMate:
                 print("💡 Found something helpful for you!")
                 response = kb_response
         
-        # Fallback with encouragement
+        # If knowledge base fails, use direct AI response
         if not response:
-            fallbacks = [
-                f"I want to help you with your question about diabetes, but I don't have specific information on that topic right now. What I can tell you is that managing diabetes is very manageable with the right support and information. Could you ask me something more specific? I'm here to help! 💙",
-                f"That's an interesting question! While I don't have detailed information about that specific aspect, I'm here to support you in your diabetes journey. Is there something else about diabetes management, nutrition, or daily care that I can help you with? 🌟"
-            ]
-            response = fallbacks[0]
+            print("🧠 Let me help you with what I know...")
+            prompt = self.create_conversation_prompt(english_input, query_type, language_name)
+            response = self.call_bedrock_model(prompt)
         
         # Add encouragement occasionally
         if any(word in english_input.lower() for word in ['scared', 'worried', 'difficult', 'hard', 'confused']):
@@ -287,13 +352,8 @@ class SmartMedicalSearchGlucoMate:
         if target_language_code != 'en':
             response = self.translate_response(response, target_language_code)
         
-        # Warm disclaimer
-        disclaimer = f"""
-
-💙 **A caring reminder**: I'm here to provide educational support and encouragement, but I'm not a replacement for your healthcare team. For personalized medical advice, always check with your doctor or diabetes educator. In any emergency, please call 911 immediately.
-
-🌟 **You've got this!** Managing diabetes is a journey, and I'm here to support you along the way."""
-        
+        # Add disclaimer only for medical questions
+        disclaimer = "\n\nDisclaimer: This information is educational only. Always consult your healthcare provider for medical decisions."
         if target_language_code != 'en':
             disclaimer = self.translate_response(disclaimer, target_language_code)
         
@@ -307,34 +367,32 @@ class SmartMedicalSearchGlucoMate:
         return response + disclaimer
 
 def main():
-    print("💙 Hello! I'm GlucoMate, your caring diabetes companion")
-    print("🌟 I'm here to support you with warmth, understanding, and reliable information")
-    print("✨ Together, we can make managing diabetes feel less overwhelming")
-    
+    print("💙 Hello! I'm GlucoMate, your caring diabetes companion. I'm here to support you with warmth, understanding, and reliable information. Together, we can make managing diabetes feel less overwhelming.")
+ 
     bot = SmartMedicalSearchGlucoMate()
     
     print(f"\n🌍 I can chat with you in multiple languages!")
     for key, (lang_name, lang_code) in bot.supported_languages.items():
         flag_emoji = {'en': '🇺🇸', 'ar': '🇸🇦', 'fr': '🇫🇷', 'es': '🇪🇸', 'pt': '🇧🇷', 'de': '🇩🇪'}
-        print(f"{key}. {flag_emoji.get(lang_code, '🌍')} {lang_name}")
+        print(f"{key}. {flag_emoji.get(lang_code, '')} {lang_name}")
     
     # Get language choice
     while True:
-        choice = input("\n💫 Which language feels most comfortable for you? (1-6): ").strip()
+        choice = input("\nWhich language feels most comfortable for you? (1-6): ").strip()
         if choice in bot.supported_languages:
             language_name, language_code = bot.supported_languages[choice]
             break
         else:
-            print("😊 Please choose a number between 1-6")
+            print("Please choose a number between 1-6")
     
     print(f"\n✨ Perfect! Let's chat in {language_name}")
     
     welcome_suggestions = [
-        "💭 'What should I know about managing my blood sugar?'",
-        "🍎 'What foods are good for diabetes?'",
-        "💪 'How can exercise help with diabetes?'",
-        "😌 'I'm feeling overwhelmed about my diagnosis'",
-        "🩺 'What should I ask my doctor at my next visit?'"
+        "'What should I know about managing my blood sugar?'",
+        "'What foods are good for diabetes?'",
+        "'How can exercise help with diabetes?'",
+        "'I'm feeling overwhelmed about my diagnosis'",
+        "'What should I ask my doctor at my next visit?'"
     ]
     
     print("💙 I'm here to listen and help! You can ask me anything about diabetes.")
@@ -345,7 +403,7 @@ def main():
     
     try:
         while True:
-            user_input = input("\n😊 You: ").strip()
+            user_input = input("\nYou: ").strip()
             
             if user_input.lower() in ['quit', 'exit', 'bye', 'goodbye', 'stop']:
                 farewell = "💙 Take care of yourself! Remember, you're doing great by staying informed about your health. I'm always here when you need support. Wishing you all the best! 🌟"
