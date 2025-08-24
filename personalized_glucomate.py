@@ -1,20 +1,22 @@
+"""
+GlucoMate Level 5: Personalized Care
+Inherits: Bedrock core, safety, multilingual, knowledge base, smart search
+Adds: Patient profiles, medication tracking, personalized responses
+"""
+
 import boto3
 import json
 import sys
 import os
 import sqlite3
-from datetime import datetime, timedelta
 import threading
 import time
-from dotenv import load_dotenv
-from googleapiclient.discovery import build
-import re
-from medical_safety import MedicalSafetyGuardrails
-
-# Load environment variables
-load_dotenv()
+from datetime import datetime, timedelta
+from smart_search_glucomate import SmartMedicalSearchGlucoMate
 
 class PatientDatabase:
+    """Database handler for patient information"""
+    
     def __init__(self, db_path="patient_data.db"):
         self.db_path = db_path
         self.init_database()
@@ -41,7 +43,8 @@ class PatientDatabase:
                 dietary_restrictions TEXT,
                 allergies TEXT,
                 language_preference TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
@@ -57,6 +60,7 @@ class PatientDatabase:
                 start_date TEXT,
                 end_date TEXT,
                 active BOOLEAN DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (patient_id) REFERENCES patient_profile (patient_id)
             )
         ''')
@@ -67,7 +71,7 @@ class PatientDatabase:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 patient_id TEXT,
                 reading REAL,
-                timestamp TIMESTAMP,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 meal_context TEXT,
                 notes TEXT,
                 FOREIGN KEY (patient_id) REFERENCES patient_profile (patient_id)
@@ -85,6 +89,7 @@ class PatientDatabase:
                 budget_range TEXT,
                 cooking_skills TEXT,
                 meal_prep_time TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (patient_id) REFERENCES patient_profile (patient_id)
             )
         ''')
@@ -93,92 +98,113 @@ class PatientDatabase:
         conn.close()
     
     def get_patient_profile(self, patient_id):
-        """Get complete patient profile"""
+        """Get complete patient profile with all related data"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('SELECT * FROM patient_profile WHERE patient_id = ?', (patient_id,))
-        profile = cursor.execute('SELECT * FROM patient_profile WHERE patient_id = ?', (patient_id,)).fetchone()
-        
-        if profile:
+        try:
+            # Get main profile
+            cursor.execute('SELECT * FROM patient_profile WHERE patient_id = ?', (patient_id,))
+            profile = cursor.fetchone()
+            
+            if not profile:
+                return None
+            
+            # Convert to dictionary
             columns = [desc[0] for desc in cursor.description]
             profile_dict = dict(zip(columns, profile))
             
             # Get medications
             cursor.execute('SELECT * FROM medications WHERE patient_id = ? AND active = 1', (patient_id,))
             medications = cursor.fetchall()
+            profile_dict['medications'] = medications
             
             # Get meal preferences
             cursor.execute('SELECT * FROM meal_preferences WHERE patient_id = ?', (patient_id,))
             meal_prefs = cursor.fetchone()
+            profile_dict['meal_preferences'] = meal_prefs
             
             # Get recent glucose readings
-            cursor.execute('''SELECT * FROM glucose_readings WHERE patient_id = ? 
-                             ORDER BY timestamp DESC LIMIT 10''', (patient_id,))
+            cursor.execute('''
+                SELECT * FROM glucose_readings WHERE patient_id = ? 
+                ORDER BY timestamp DESC LIMIT 10
+            ''', (patient_id,))
             recent_readings = cursor.fetchall()
-            
-            profile_dict['medications'] = medications
-            profile_dict['meal_preferences'] = meal_prefs
             profile_dict['recent_readings'] = recent_readings
+            
+            return profile_dict
+            
+        except Exception as e:
+            print(f"Error getting patient profile: {e}")
+            return None
+        finally:
+            conn.close()
+    
+    def save_patient_profile(self, patient_data):
+        """Save or update patient profile"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        conn.close()
-        return profile_dict if profile else None
+        try:
+            # Insert or update patient profile
+            cursor.execute('''
+                INSERT OR REPLACE INTO patient_profile 
+                (patient_id, name, age, diabetes_type, hba1c, target_glucose_min, target_glucose_max, 
+                 weight, height, activity_level, dietary_restrictions, allergies, language_preference, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                patient_data.get('patient_id'),
+                patient_data.get('name'),
+                patient_data.get('age'),
+                patient_data.get('diabetes_type'),
+                patient_data.get('hba1c'),
+                patient_data.get('target_glucose_min', 80),
+                patient_data.get('target_glucose_max', 130),
+                patient_data.get('weight'),
+                patient_data.get('height'),
+                patient_data.get('activity_level'),
+                patient_data.get('dietary_restrictions'),
+                patient_data.get('allergies'),
+                patient_data.get('language_preference', 'en'),
+                datetime.now().isoformat()
+            ))
+            
+            conn.commit()
+            return True
+            
+        except Exception as e:
+            print(f"Error saving patient profile: {e}")
+            return False
+        finally:
+            conn.close()
 
-class PersonalizedGlucoMate:
+class PersonalizedGlucoMate(SmartMedicalSearchGlucoMate):
+    """
+    Level 5: Adds personalization and patient data management
+    Inherits: Bedrock core, safety, multilingual, knowledge base, smart search
+    Adds: Patient profiles, medication tracking, personalized responses
+    """
+    
     def __init__(self, patient_id=None):
-        self.bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
-        self.bedrock_agent = boto3.client('bedrock-agent-runtime', region_name='us-east-1')
-        self.translate_client = boto3.client('translate', region_name='us-east-1')
-        self.safety = MedicalSafetyGuardrails()
-        self.model_id = "amazon.titan-text-premier-v1:0"
+        super().__init__()  # Get ALL previous functionality
         
-        # Patient data
-        self.patient_db = PatientDatabase()
+        # Patient-specific data
         self.patient_id = patient_id
         self.patient_profile = None
         self.medication_timer = None
         self.conversation_active = False
         
-        # Chat-based profile collection state
+        # Database setup
+        self.patient_db = PatientDatabase()
+        
+        # Profile collection state
         self.collecting_profile = False
-        self.profile_questions = []
-        self.current_question_index = 0
-        self.temp_profile_data = {}
-        self.original_request = None  # Store what they originally asked for
-        
-        if patient_id:
-            self.load_patient_data()
-            self.start_medication_monitoring()
-        
-        # Get credentials from environment variables
-        self.google_api_key = os.getenv('GOOGLE_API_KEY')
-        self.search_engine_id = os.getenv('SEARCH_ENGINE_ID')
-        self.knowledge_base_id = os.getenv('KNOWLEDGE_BASE_ID', 'GXJOYBIHCU')
-        
-        # Initialize Google Search
-        try:
-            if self.google_api_key:
-                self.search_service = build("customsearch", "v1", developerKey=self.google_api_key)
-                print("🔍 Connected to trusted medical sources")
-            else:
-                self.search_service = None
-                print("💭 Using knowledge base only")
-        except Exception as e:
-            self.search_service = None
-            print("💭 Search temporarily unavailable - using medical knowledge base")
-        
-        # Supported languages
-        self.supported_languages = {
-            '1': ('English', 'en'),
-            '2': ('Arabic', 'ar'), 
-            '3': ('French', 'fr'),
-            '4': ('Spanish', 'es'),
-            '5': ('Portuguese', 'pt'),
-            '6': ('German', 'de')
-        }
-        
-        # Profile questions for chat collection
-        self.medical_form_questions = [
+        self.profile_questions = [
+            {
+                "field": "name",
+                "question": "What's your name? (This helps me personalize our conversations)",
+                "required": False
+            },
             {
                 "field": "diabetes_type",
                 "question": "What type of diabetes do you have? (Type 1, Type 2, or Gestational)",
@@ -186,13 +212,8 @@ class PersonalizedGlucoMate:
             },
             {
                 "field": "age", 
-                "question": "What's your age?",
+                "question": "What's your age? (This helps me give age-appropriate advice)",
                 "required": True
-            },
-            {
-                "field": "weight",
-                "question": "What's your current weight in kg? (You can say 'skip' if you prefer not to share)",
-                "required": False
             },
             {
                 "field": "activity_level",
@@ -201,155 +222,190 @@ class PersonalizedGlucoMate:
             },
             {
                 "field": "dietary_restrictions",
-                "question": "Do you have any dietary restrictions or preferences? (Vegetarian, Vegan, Halal, Kosher, None, etc.)",
+                "question": "Do you have any dietary restrictions? (Vegetarian, Vegan, Halal, Kosher, None, etc.)",
                 "required": False
             },
             {
-                "field": "allergies",
-                "question": "Do you have any food allergies I should know about? (You can say 'none' if not)",
+                "field": "target_glucose_min",
+                "question": "What's your target blood sugar range? Please give me the LOW number (usually 80-100)",
                 "required": False
             },
             {
-                "field": "cultural_preferences",
-                "question": "Any cultural or regional food preferences? (Mediterranean, Asian, Latin, etc.)",
-                "required": False
-            },
-            {
-                "field": "budget_range", 
-                "question": "What's your grocery budget range? (Low, Moderate, High)",
+                "field": "target_glucose_max", 
+                "question": "And what's the HIGH number of your target range? (usually 120-180)",
                 "required": False
             }
         ]
-        
-        # Encouraging phrases
-        self.encouragement = [
-            "You're taking a positive step by learning about your health.",
-            "It's wonderful that you're being proactive about your diabetes care.",
-            "Taking control of your diabetes is empowering - you're on the right track.",
-            "Every small step towards better health matters.",
-            "You're not alone in this journey - many people successfully manage diabetes."
-        ]
-    
-    def check_profile_completeness(self):
-        """Check if patient has enough data for personalization"""
-        if not self.patient_profile:
-            return {"complete": False, "missing": "all"}
-        
-        # Essential fields for personalization
-        essential_fields = ['diabetes_type', 'age', 'activity_level']
-        missing_fields = []
-        
-        for field in essential_fields:
-            if not self.patient_profile.get(field):
-                missing_fields.append(field)
-        
-        return {
-            "complete": len(missing_fields) == 0,
-            "missing": missing_fields,
-            "has_some_data": len(missing_fields) < len(essential_fields)
-        }
-    
-    def generate_general_meal_plan(self):
-        """Generate a general meal plan when no profile data available"""
-        general_prompt = """
-        Create a general diabetes-friendly meal plan suitable for most people with diabetes:
-        
-        Please create a 3-day meal plan that:
-        1. Is suitable for both Type 1 and Type 2 diabetes
-        2. Includes breakfast, lunch, dinner, and 2 snacks per day
-        3. Has moderate carb counts (30-45g per meal, 15g per snack)
-        4. Uses common, accessible ingredients
-        5. Includes simple preparation instructions
-        6. Provides a basic grocery shopping list
-        7. Offers tips for blood sugar management
-        
-        Make it practical and encouraging for someone just starting to manage their diabetes diet.
-        """
-        
-        response = self.call_bedrock_model(general_prompt)
-        
-        # Add personalization offer
-        offer_personalization = """
-        
-        📋 This is a general meal plan that works well for most people with diabetes. 
-        
-        🎯 **Want something more personalized?** I can create a custom meal plan based on your specific diabetes type, food preferences, activity level, and dietary needs! 
-        
-        Would you like me to ask you a few quick questions to make this more tailored to you? It will only take 2-3 minutes and I'll save the info for future conversations!
-        
-        Just say "yes, personalize it" or "make it personal" and I'll guide you through it! 📝
-        """
-        
-        return response + offer_personalization
-    
-    def start_profile_collection(self, original_request):
-        """Start collecting profile data through chat"""
-        self.collecting_profile = True
         self.current_question_index = 0
         self.temp_profile_data = {}
+        self.original_request = None
+        
+        if patient_id:
+            self.load_patient_data()
+            self.start_medication_monitoring()
+        
+        print("👤 GlucoMate Level 5: Personalization engine loaded")
+    
+    def load_patient_data(self):
+        """Load patient data from database"""
+        if self.patient_id:
+            self.patient_profile = self.patient_db.get_patient_profile(self.patient_id)
+            if self.patient_profile:
+                name = self.patient_profile.get('name', 'there')
+                diabetes_type = self.patient_profile.get('diabetes_type', 'diabetes')
+                print(f"👋 Welcome back, {name}! Ready to help with your {diabetes_type} management.")
+            else:
+                print(f"📝 New patient profile will be created for ID: {self.patient_id}")
+    
+    def start_medication_monitoring(self):
+        """Start background medication reminder monitoring"""
+        if self.patient_profile and self.patient_profile.get('medications'):
+            self.medication_timer = threading.Thread(target=self._medication_monitor, daemon=True)
+            self.medication_timer.start()
+            print("💊 Medication reminder system activated")
+    
+    def _medication_monitor(self):
+        """Background medication reminder checker"""
+        while self.conversation_active:
+            try:
+                reminder = self.check_medication_time()
+                if reminder:
+                    print(f"\n🔔 MEDICATION REMINDER: {reminder}")
+                    # In a real implementation, this would interrupt the conversation appropriately
+                
+                time.sleep(60)  # Check every minute
+            except Exception as e:
+                print(f"Medication monitoring error: {e}")
+                break
+    
+    def check_medication_time(self):
+        """Check if it's time for any medication"""
+        if not self.patient_profile or not self.patient_profile.get('medications'):
+            return None
+        
+        current_time = datetime.now().time()
+        current_hour_minute = current_time.strftime("%H:%M")
+        
+        for medication in self.patient_profile['medications']:
+            med_name = medication[2]  # medication_name
+            time_slots = medication[5]  # time_slots (JSON string)
+            
+            if time_slots:
+                try:
+                    times = json.loads(time_slots)
+                    for time_slot in times:
+                        # Check if within 5 minutes of medication time
+                        if abs(self._time_difference_minutes(current_hour_minute, time_slot)) <= 2:
+                            return f"Time for your {med_name}! 💊"
+                except Exception as e:
+                    print(f"Error parsing medication times: {e}")
+        
+        return None
+    
+    def _time_difference_minutes(self, time1, time2):
+        """Calculate difference between two time strings in minutes"""
+        try:
+            t1 = datetime.strptime(time1, "%H:%M").time()
+            t2 = datetime.strptime(time2, "%H:%M").time()
+            
+            # Convert to minutes since midnight
+            t1_minutes = t1.hour * 60 + t1.minute
+            t2_minutes = t2.hour * 60 + t2.minute
+            
+            return abs(t1_minutes - t2_minutes)
+        except:
+            return 999  # Large number if parsing fails
+    
+    def check_profile_completeness(self):
+        """Check if patient has sufficient data for personalization"""
+        if not self.patient_profile:
+            return {"complete": False, "missing": "all", "has_some_data": False}
+        
+        # Essential fields for personalization
+        essential_fields = ['diabetes_type', 'age']
+        helpful_fields = ['activity_level', 'dietary_restrictions', 'target_glucose_min']
+        
+        missing_essential = [field for field in essential_fields 
+                           if not self.patient_profile.get(field)]
+        missing_helpful = [field for field in helpful_fields 
+                         if not self.patient_profile.get(field)]
+        
+        return {
+            "complete": len(missing_essential) == 0,
+            "missing_essential": missing_essential,
+            "missing_helpful": missing_helpful,
+            "has_some_data": len(missing_essential) < len(essential_fields)
+        }
+    
+    def start_profile_collection(self, original_request=""):
+        """Start collecting profile data through conversation"""
+        self.collecting_profile = True
+        self.current_question_index = 0
+        self.temp_profile_data = {'patient_id': self.patient_id}
         self.original_request = original_request
         
-        welcome_msg = """
-        Great! I'll ask you a few quick questions to personalize your diabetes care. This information will be securely saved to your profile so I can give you better recommendations in the future.
+        welcome_msg = f"""
+        Great! I'd love to personalize your diabetes care. I'll ask you a few questions to understand your specific needs better. 
         
-        You can say 'skip' for any question you don't want to answer, or 'stop' if you want to quit and use the general recommendations instead.
+        This information will be securely saved to help me give you more relevant advice in the future. You can say 'skip' for any question or 'stop' to exit.
         
         Let's get started! 🚀
         """
         
-        first_question = self.get_current_question()
+        first_question = self.get_current_profile_question()
         return welcome_msg + "\n\n" + first_question
     
-    def get_current_question(self):
-        """Get the current question in the profile collection flow"""
-        if self.current_question_index < len(self.medical_form_questions):
-            question_data = self.medical_form_questions[self.current_question_index]
-            required_text = " (Required)" if question_data["required"] else " (Optional)"
-            return f"**Question {self.current_question_index + 1}/{len(self.medical_form_questions)}**{required_text}: {question_data['question']}"
-        return None
+    def get_current_profile_question(self):
+        """Get the current question in profile collection"""
+        if self.current_question_index >= len(self.profile_questions):
+            return None
+        
+        question_data = self.profile_questions[self.current_question_index]
+        required_text = " (Required)" if question_data["required"] else " (Optional)"
+        
+        return f"**Question {self.current_question_index + 1}/{len(self.profile_questions)}**{required_text}: {question_data['question']}"
     
     def process_profile_answer(self, user_input):
-        """Process an answer during profile collection"""
+        """Process profile collection answers"""
         user_input_lower = user_input.lower().strip()
         
-        # Check for stop commands
-        if user_input_lower in ['stop', 'quit', 'cancel', 'nevermind']:
+        # Handle stop commands
+        if user_input_lower in ['stop', 'quit', 'cancel', 'exit']:
             self.collecting_profile = False
-            return "No problem! I'll use general recommendations for now. You can always set up your profile later. Let me get back to your original question..."
+            return "No problem! You can always set up your profile later by saying 'create my profile'. What would you like to know about diabetes?"
         
-        # Get current question data
-        if self.current_question_index >= len(self.medical_form_questions):
+        # Get current question
+        if self.current_question_index >= len(self.profile_questions):
             return self.complete_profile_collection()
         
-        current_question = self.medical_form_questions[self.current_question_index]
+        current_question = self.profile_questions[self.current_question_index]
         field_name = current_question["field"]
         
-        # Handle skip for optional questions
+        # Handle skip
         if user_input_lower == 'skip' and not current_question["required"]:
             self.temp_profile_data[field_name] = None
         elif user_input_lower == 'skip' and current_question["required"]:
-            return f"This question is required for personalization. {current_question['question']}"
+            return f"This question helps me give you better care. {current_question['question']}"
         else:
-            # Validate and store the answer
-            validated_answer = self.validate_answer(field_name, user_input)
-            if validated_answer["valid"]:
-                self.temp_profile_data[field_name] = validated_answer["value"]
+            # Validate and store answer
+            validated = self.validate_profile_answer(field_name, user_input)
+            if validated["valid"]:
+                self.temp_profile_data[field_name] = validated["value"]
             else:
-                return f"I didn't quite understand that. {validated_answer['error']} Please try again: {current_question['question']}"
+                return f"I didn't understand that. {validated['error']} Please try again: {current_question['question']}"
         
         # Move to next question
         self.current_question_index += 1
         
-        # Check if we have more questions
-        if self.current_question_index < len(self.medical_form_questions):
-            next_question = self.get_current_question()
-            progress = f"Thanks! ({self.current_question_index}/{len(self.medical_form_questions)} completed)\n\n"
+        if self.current_question_index < len(self.profile_questions):
+            next_question = self.get_current_profile_question()
+            progress = f"Thanks! ({self.current_question_index}/{len(self.profile_questions)} completed)\n\n"
             return progress + next_question
         else:
             return self.complete_profile_collection()
     
-    def validate_answer(self, field_name, user_input):
-        """Validate answers based on field type"""
+    def validate_profile_answer(self, field_name, user_input):
+        """Validate profile answers"""
         user_input = user_input.strip()
         
         if field_name == "diabetes_type":
@@ -368,193 +424,127 @@ class PersonalizedGlucoMate:
                 age = int(user_input)
                 if 1 <= age <= 120:
                     return {"valid": True, "value": age}
-                return {"valid": False, "error": "Please enter a valid age between 1 and 120."}
+                return {"valid": False, "error": "Please enter an age between 1 and 120."}
             except:
                 return {"valid": False, "error": "Please enter your age as a number."}
         
-        elif field_name == "weight":
+        elif field_name in ["target_glucose_min", "target_glucose_max"]:
             try:
-                weight = float(user_input)
-                if 20 <= weight <= 300:  # Reasonable weight range in kg
-                    return {"valid": True, "value": weight}
-                return {"valid": False, "error": "Please enter a weight between 20-300 kg."}
+                glucose = int(user_input)
+                if 50 <= glucose <= 300:
+                    return {"valid": True, "value": glucose}
+                return {"valid": False, "error": "Please enter a glucose value between 50-300 mg/dL."}
             except:
-                return {"valid": False, "error": "Please enter your weight as a number."}
+                return {"valid": False, "error": "Please enter a number for glucose levels."}
         
         elif field_name == "activity_level":
             activity_mapping = {
-                "sedentary": "Sedentary", "sitting": "Sedentary", "inactive": "Sedentary",
-                "light": "Light", "lightly active": "Light", "light activity": "Light",
-                "moderate": "Moderate", "moderately active": "Moderate", "moderate activity": "Moderate",
+                "sedentary": "Sedentary", "inactive": "Sedentary",
+                "light": "Light", "lightly active": "Light",
+                "moderate": "Moderate", "moderately active": "Moderate",
                 "active": "Active", "very active": "Very Active", "highly active": "Very Active"
             }
             normalized = user_input.lower()
             for key, value in activity_mapping.items():
                 if key in normalized:
                     return {"valid": True, "value": value}
-            return {"valid": False, "error": "Please choose from: Sedentary, Light, Moderate, Active, or Very Active."}
+            return {"valid": False, "error": "Please choose: Sedentary, Light, Moderate, Active, or Very Active."}
         
         else:
             # For text fields, just clean and return
             return {"valid": True, "value": user_input.strip() if user_input.strip() else None}
     
     def complete_profile_collection(self):
-        """Complete the profile collection and save to database"""
+        """Complete profile collection and save data"""
         self.collecting_profile = False
         
-        # Save to database (integrate with your existing database)
-        self.save_profile_to_database()
+        # Save to database
+        success = self.patient_db.save_patient_profile(self.temp_profile_data)
         
-        # Reload patient profile
-        self.load_patient_data()
-        
-        completion_msg = """
-        🎉 Perfect! I've saved your information to your profile. Now I can give you much more personalized recommendations!
-        
-        Your profile includes:
-        """
-        
-        # Show what was collected
-        for key, value in self.temp_profile_data.items():
-            if value:
-                readable_key = key.replace('_', ' ').title()
-                completion_msg += f"✅ {readable_key}: {value}\n"
-        
-        completion_msg += "\nNow let me create that personalized meal plan for you! 🍽️\n\n"
-        
-        # Clear temp data
-        self.temp_profile_data = {}
-        
-        # Generate the original request with new profile data
-        if "meal plan" in self.original_request.lower():
-            personalized_plan = self.generate_personalized_meal_plan()
-            return completion_msg + personalized_plan
-        else:
-            return completion_msg + "What would you like to know about your diabetes management?"
-    
-    def save_profile_to_database(self):
-        """Save collected profile data to your existing database"""
-        if not self.patient_id or not self.temp_profile_data:
-            return
-        
-        # This would integrate with your team's existing database
-        conn = sqlite3.connect(self.patient_db.db_path)
-        cursor = conn.cursor()
-        
-        # Update existing profile or create new one
-        update_fields = []
-        values = []
-        
-        for field, value in self.temp_profile_data.items():
-            if value is not None:
-                update_fields.append(f"{field} = ?")
-                values.append(value)
-        
-        if update_fields:
-            values.append(self.patient_id)
-            query = f"""
-                INSERT INTO patient_profile (patient_id, {', '.join(self.temp_profile_data.keys())})
-                VALUES ({', '.join(['?' for _ in self.temp_profile_data.values()])})
-                ON CONFLICT(patient_id) 
-                DO UPDATE SET {', '.join(update_fields)}
+        if success:
+            # Reload patient profile
+            self.load_patient_data()
+            
+            completion_msg = """
+            🎉 Perfect! Your profile has been saved. Now I can give you much more personalized diabetes care!
+            
+            Your profile includes:
             """
             
-            # For SQLite compatibility, use INSERT OR REPLACE
-            profile_values = [self.patient_id] + list(self.temp_profile_data.values())
-            cursor.execute(f"""
-                INSERT OR REPLACE INTO patient_profile 
-                (patient_id, {', '.join(self.temp_profile_data.keys())})
-                VALUES ({', '.join(['?' for _ in profile_values])})
-            """, profile_values)
-        
-        conn.commit()
-        conn.close()
-        """Load patient data from database"""
-        if self.patient_id:
-            self.patient_profile = self.patient_db.get_patient_profile(self.patient_id)
-            if self.patient_profile:
-                print(f"👋 Welcome back, {self.patient_profile.get('name', 'there')}!")
-    
-    def start_medication_monitoring(self):
-        """Start background thread for medication reminders"""
-        if self.patient_profile and self.patient_profile.get('medications'):
-            self.medication_timer = threading.Thread(target=self._medication_monitor, daemon=True)
-            self.medication_timer.start()
-    
-    def _medication_monitor(self):
-        """Background medication reminder checker"""
-        while True:
-            if self.conversation_active and self.patient_profile:
-                reminder = self.check_medication_time()
-                if reminder:
-                    print(f"\n🔔 MEDICATION REMINDER: {reminder}")
-                    # In a real app, this would interrupt the conversation
-                    
-            time.sleep(60)  # Check every minute
-    
-    def check_medication_time(self):
-        """Check if it's time for any medication"""
-        if not self.patient_profile or not self.patient_profile.get('medications'):
-            return None
-        
-        current_time = datetime.now().time()
-        current_hour_minute = current_time.strftime("%H:%M")
-        
-        for medication in self.patient_profile['medications']:
-            med_name = medication[2]  # medication_name
-            time_slots = medication[5]  # time_slots (JSON string)
+            for key, value in self.temp_profile_data.items():
+                if value and key != 'patient_id':
+                    readable_key = key.replace('_', ' ').title()
+                    completion_msg += f"✅ {readable_key}: {value}\n"
             
-            if time_slots:
-                try:
-                    times = json.loads(time_slots)
-                    for time_slot in times:
-                        if time_slot == current_hour_minute:
-                            return f"Time to take your {med_name}! 💊"
-                except:
-                    pass
-        
-        return None
+            completion_msg += "\nNow I can provide personalized meal plans, medication reminders, and targeted advice! 🌟"
+            
+            # Clear temp data
+            self.temp_profile_data = {}
+            
+            return completion_msg
+        else:
+            return "❌ Sorry, there was an issue saving your profile. Please try again later."
     
-    def generate_personalized_meal_plan(self):
-        """Generate meal plan based on patient profile"""
-        if not self.patient_profile:
-            return "I'd love to create a personalized meal plan for you! Please complete your profile first."
+    def create_personalized_prompt(self, user_input, language="English", conversation_type="medical"):
+        """Create prompts that include patient context"""
         
-        profile = self.patient_profile
-        meal_prefs = profile.get('meal_preferences', {})
+        # Build patient context
+        patient_context = ""
+        if self.patient_profile:
+            name = self.patient_profile.get('name', 'Patient')
+            diabetes_type = self.patient_profile.get('diabetes_type', 'diabetes')
+            age = self.patient_profile.get('age')
+            target_min = self.patient_profile.get('target_glucose_min', 80)
+            target_max = self.patient_profile.get('target_glucose_max', 130)
+            activity = self.patient_profile.get('activity_level')
+            restrictions = self.patient_profile.get('dietary_restrictions')
+            
+            patient_context = f"""
+            Patient Context for {name}:
+            - Diabetes Type: {diabetes_type}
+            - Age: {age if age else 'Not specified'}
+            - Target Glucose Range: {target_min}-{target_max} mg/dL
+            - Activity Level: {activity if activity else 'Not specified'}
+            - Dietary Restrictions: {restrictions if restrictions else 'None specified'}
+            - Recent Average Glucose: {self._get_recent_glucose_summary()}
+            
+            Personalization Instructions:
+            - Address them by name when appropriate
+            - Reference their specific diabetes type in advice
+            - Consider their target range when discussing blood sugar
+            - Adapt exercise advice to their activity level
+            - Respect their dietary restrictions in food recommendations
+            """
         
-        meal_plan_prompt = f"""
-        Create a personalized 3-day diabetes-friendly meal plan for this patient:
+        # Use inherited base prompt and enhance with personalization
+        if conversation_type == "casual":
+            base_prompt = self.create_base_diabetes_prompt(
+                user_input, 
+                additional_context=patient_context,
+                language=language, 
+                conversation_type=conversation_type
+            )
+        else:
+            # For medical conversations, add personalization context
+            enhanced_context = patient_context + """
+            
+            Make your response highly personalized by:
+            1. Using their name naturally in conversation
+            2. Referencing their specific diabetes type and management needs
+            3. Considering their personal target ranges and goals
+            4. Providing advice appropriate for their age and activity level
+            5. Respecting their dietary preferences and restrictions
+            6. Connecting advice to their personal diabetes journey
+            """
+            
+            base_prompt = self.create_base_diabetes_prompt(
+                user_input,
+                additional_context=enhanced_context,
+                language=language,
+                conversation_type=conversation_type
+            )
         
-        Patient Profile:
-        - Diabetes Type: {profile.get('diabetes_type', 'Not specified')}
-        - Age: {profile.get('age', 'Not specified')}
-        - Weight: {profile.get('weight', 'Not specified')} kg
-        - Activity Level: {profile.get('activity_level', 'Moderate')}
-        - Target Glucose: {profile.get('target_glucose_min', 80)}-{profile.get('target_glucose_max', 130)} mg/dL
-        
-        Dietary Information:
-        - Dietary Restrictions: {profile.get('dietary_restrictions', 'None')}
-        - Allergies: {profile.get('allergies', 'None')}
-        - Preferred Foods: {meal_prefs.get('preferred_foods') if meal_prefs else 'Not specified'}
-        - Cultural Preferences: {meal_prefs.get('cultural_preferences') if meal_prefs else 'Not specified'}
-        - Budget: {meal_prefs.get('budget_range') if meal_prefs else 'Moderate'}
-        - Cooking Skills: {meal_prefs.get('cooking_skills') if meal_prefs else 'Intermediate'}
-        
-        Recent Glucose Readings: {self._get_recent_glucose_summary()}
-        
-        Please create a detailed 3-day meal plan with:
-        1. Breakfast, lunch, dinner, and 2 snacks per day
-        2. Estimated carb counts for each meal
-        3. Portion sizes
-        4. Simple preparation instructions
-        5. Grocery shopping list
-        6. Tips for blood sugar management
-        
-        Make it personal, practical, and encouraging!
-        """
-        
-        return self.call_bedrock_model(meal_plan_prompt)
+        return base_prompt
     
     def _get_recent_glucose_summary(self):
         """Get summary of recent glucose readings"""
@@ -567,316 +557,274 @@ class PersonalizedGlucoMate:
             return f"Average of last {len(readings)} readings: {avg_reading:.1f} mg/dL"
         return "No recent readings"
     
-    def classify_query_type(self, question):
-        """Enhanced classification including personal requests"""
-        question_lower = question.lower()
+    def generate_personalized_meal_plan(self, target_language_code='en'):
+        """Generate meal plan based on patient profile"""
+        if not self.patient_profile:
+            return "I'd love to create a personalized meal plan! Let me first get to know you better. Would you like to set up your profile?"
         
-        # Personal/healthcare management requests
-        personal_indicators = [
-            "meal plan", "diet plan", "what should i eat", "food recommendations",
-            "my glucose", "my readings", "my medication", "my profile",
-            "remind me", "track my", "log my", "record my"
-        ]
+        profile = self.patient_profile
+        name = profile.get('name', 'friend')
         
-        # Casual conversation
-        casual_indicators = [
-            "hi", "hello", "hey", "how are you", "what's up", "thanks", "thank you",
-            "good morning", "good afternoon", "good evening", "bye", "goodbye",
-            "comment ça va", "ça va", "كيف حالك", "¿cómo estás"
-        ]
+        meal_plan_prompt = f"""
+        Create a highly personalized 3-day diabetes meal plan for {name}:
         
-        # Medical information requests
-        medical_indicators = [
-            "diabetes", "blood sugar", "glucose", "insulin", "medication", "diet",
-            "exercise", "symptoms", "treatment", "doctor", "health", "medical"
-        ]
+        Patient Profile:
+        - Name: {profile.get('name', 'Patient')}
+        - Diabetes Type: {profile.get('diabetes_type', 'Not specified')}
+        - Age: {profile.get('age', 'Not specified')}
+        - Target Glucose Range: {profile.get('target_glucose_min', 80)}-{profile.get('target_glucose_max', 130)} mg/dL
+        - Activity Level: {profile.get('activity_level', 'Moderate')}
+        - Dietary Restrictions: {profile.get('dietary_restrictions', 'None')}
+        - Recent Glucose Average: {self._get_recent_glucose_summary()}
         
-        # Check for personal/personalized requests
-        if any(personal in question_lower for personal in personal_indicators):
-            return "personal"
+        Create a meal plan that:
+        1. Is specifically tailored to their diabetes type
+        2. Fits their target glucose range
+        3. Matches their activity level (calories and timing)
+        4. Respects their dietary restrictions completely
+        5. Is age-appropriate
+        6. Includes practical tips for {name} specifically
+        7. Has encouraging, personal language throughout
         
-        # Check for casual conversation
-        if any(casual in question_lower for casual in casual_indicators):
-            return "casual"
+        Format: 3 days with breakfast, lunch, dinner, and 2 snacks each day.
+        Include carb counts, portion sizes, and personalized tips for {name}.
+        """
         
-        # Check for medical information
-        if any(med_word in question_lower for med_word in medical_indicators):
-            current_keywords = ["latest", "recent", "new", "current", "2024", "2025"]
-            if any(kw in question_lower for kw in current_keywords):
-                return "current_medical"
-            return "medical"
+        response = self.call_bedrock_model(meal_plan_prompt, conversation_type="medical")
         
-        return "medical"  # Default to medical
-    
-    def create_personalized_prompt(self, user_input, query_type, language="English"):
-        """Create prompts that include patient context"""
-        
-        patient_context = ""
-        if self.patient_profile:
-            patient_context = f"""
-            Patient Context:
-            - Name: {self.patient_profile.get('name', 'Patient')}
-            - Diabetes Type: {self.patient_profile.get('diabetes_type', 'Not specified')}
-            - Age: {self.patient_profile.get('age', 'Not specified')}
-            - Recent HbA1c: {self.patient_profile.get('hba1c', 'Not available')}%
-            - Target Glucose Range: {self.patient_profile.get('target_glucose_min', 80)}-{self.patient_profile.get('target_glucose_max', 130)} mg/dL
-            - Activity Level: {self.patient_profile.get('activity_level', 'Not specified')}
-            - Recent Glucose Average: {self._get_recent_glucose_summary()}
-            """
-        
-        if query_type == "personal":
-            prompt = f"""You are GlucoMate, a personalized diabetes care assistant for this specific patient. 
-            
-            {patient_context}
-            
-            The patient asked: "{user_input}"
-            
-            Provide a personalized response that:
-            1. Uses their specific medical data and preferences
-            2. Addresses them by name when appropriate
-            3. References their diabetes type, targets, and recent readings
-            4. Gives specific, actionable advice based on their profile
-            5. Is warm, encouraging, and personally relevant
-            
-            Respond in {language}:"""
-            
-        elif query_type == "casual":
-            prompt = f"""You are GlucoMate, a friendly diabetes care assistant. Someone just said: "{user_input}"
-            
-            {patient_context if patient_context else ""}
-            
-            This seems like casual conversation. Respond naturally and conversationally. If you know the patient's name, you can use it naturally.
-            
-            Respond in {language} in a natural, conversational way:"""
-        
-        else:  # medical queries
-            prompt = f"""You are GlucoMate, a personalized diabetes companion for this patient.
-            
-            {patient_context}
-            
-            The patient asked: "{user_input}"
-            
-            Provide medical information that's personalized to their specific situation, diabetes type, and current management. Reference their profile when relevant.
-            
-            Respond in {language}:"""
-        
-        return prompt
-    
-    def call_bedrock_model(self, prompt):
-        try:
-            body = {
-                "inputText": prompt,
-                "textGenerationConfig": {
-                    "maxTokenCount": 2048,
-                    "temperature": 0.3,
-                    "topP": 0.9,
-                    "stopSequences": []
-                }
-            }
-            
-            response = self.bedrock_client.invoke_model(
-                modelId=self.model_id,
-                body=json.dumps(body),
-                contentType='application/json'
-            )
-            
-            response_body = json.loads(response['body'].read())
-            return response_body['results'][0]['outputText']
-            
-        except Exception as e:
-            return f"I'm having trouble connecting right now. Please try again in a moment."
-    
-    def personalized_chat(self, user_input, target_language_code='en'):
-        """Main chat function with smart profile handling"""
-        self.conversation_active = True
-        
-        # If we're in the middle of collecting profile data, handle that first
-        if self.collecting_profile:
-            return self.process_profile_answer(user_input)
-        
-        # Check for medication reminder first
-        med_reminder = self.check_medication_time()
-        if med_reminder:
-            reminder_msg = f"🔔 Hi! Before we continue our chat, {med_reminder} Don't forget to take it with water. Now, what were you asking about?"
-            return reminder_msg
-        
-        # Translate to English for processing
-        english_input = user_input if target_language_code == 'en' else user_input
-        
-        # Check for emergencies first
-        safety_check = self.safety.check_emergency_situation(english_input)
-        
-        if safety_check['is_emergency']:
-            emergency_msg = "🚨 I'm really concerned about what you're describing. This sounds like it could be a medical emergency. Please call 911 or go to your nearest emergency room right away. Your safety is the most important thing right now."
-            return emergency_msg
-        
-        # Check for personalization requests
-        personalization_triggers = [
-            "yes, personalize it", "make it personal", "personalize it", 
-            "yes please", "sure", "yes", "ok", "okay"
-        ]
-        
-        # If they're responding to a personalization offer
-        if any(trigger in english_input.lower() for trigger in personalization_triggers):
-            # Check if we just offered personalization
-            return self.start_profile_collection("meal plan")
-        
-        # Classify query type
-        query_type = self.classify_query_type(english_input)
-        
-        # Handle meal plan requests with smart profile checking
-        if "meal plan" in english_input.lower() or "diet plan" in english_input.lower() or "what should i eat" in english_input.lower():
-            profile_status = self.check_profile_completeness()
-            
-            if profile_status["complete"]:
-                # Full personalization available
-                return self.generate_personalized_meal_plan()
-            elif profile_status["has_some_data"]:
-                # Partial personalization
-                return self.generate_semi_personalized_meal_plan()
-            else:
-                # No profile data - offer general + personalization option
-                return self.generate_general_meal_plan()
-        
-        # Get language name for prompt
-        language_name = "English"
-        for code, (name, lang_code) in self.supported_languages.items():
-            if lang_code == target_language_code:
-                language_name = name
-                break
-        
-        # Handle casual conversation - instant response
-        if query_type == "casual":
-            prompt = self.create_personalized_prompt(english_input, query_type, language_name)
-            response = self.call_bedrock_model(prompt)
-            return response
-        
-        # For medical/personal queries
-        print("💭 Let me check your profile and think about this...")
-        
-        prompt = self.create_personalized_prompt(english_input, query_type, language_name)
-        response = self.call_bedrock_model(prompt)
-        
-        # Add encouragement for emotional keywords
-        if any(word in english_input.lower() for word in ['scared', 'worried', 'difficult', 'hard', 'confused']):
-            encouragement = "\n\n" + self.encouragement[hash(english_input) % len(self.encouragement)]
-            response = response + encouragement
-        
-        # Add disclaimer for medical questions
-        if query_type in ["medical", "current_medical"]:
-            disclaimer = "\n\nDisclaimer: This personalized information is educational only. Always consult your healthcare provider for medical decisions."
-            response = response + disclaimer
+        if target_language_code != 'en':
+            response = self.enhance_medical_translation(response, target_language_code)
         
         return response
     
-    def generate_semi_personalized_meal_plan(self):
-        """Generate meal plan with partial profile data"""
-        available_data = {k: v for k, v in self.patient_profile.items() if v is not None}
+    def personalized_chat(self, user_input, target_language_code='en', auto_detect=False):
+        """
+        Main personalized chat function with all inherited features
         
-        prompt = f"""
-        Create a semi-personalized diabetes meal plan based on this available patient information:
-        {json.dumps(available_data, indent=2)}
+        This integrates ALL previous levels:
+        - Bedrock core and safety (Level 1)
+        - Multilingual support (Level 2) 
+        - Knowledge base (Level 3)
+        - Smart search (Level 4)
+        - Personalization (Level 5)
+        """
+        self.conversation_active = True
         
-        Create a practical 3-day meal plan that incorporates what we know about the patient while being generally suitable for diabetes management.
+        # Handle profile collection if in progress
+        if self.collecting_profile:
+            return self.process_profile_answer(user_input)
+        
+        # Check for medication reminders
+        if self.patient_profile:
+            med_reminder = self.check_medication_time()
+            if med_reminder:
+                return f"🔔 Hi {self.patient_profile.get('name', 'there')}! {med_reminder} Now, what were you asking about?"
+        
+        # Handle profile setup requests
+        profile_triggers = [
+            'create my profile', 'set up profile', 'personalize', 'my information',
+            'tell you about me', 'get to know me'
+        ]
+        if any(trigger in user_input.lower() for trigger in profile_triggers):
+            return self.start_profile_collection(user_input)
+        
+        # Handle personalized meal plan requests
+        if 'meal plan' in user_input.lower() or 'diet plan' in user_input.lower():
+            profile_status = self.check_profile_completeness()
+            
+            if profile_status["complete"]:
+                print("👨‍🍳 Creating personalized meal plan...")
+                return self.generate_personalized_meal_plan(target_language_code)
+            elif profile_status["has_some_data"]:
+                return self.generate_semi_personalized_response(user_input, target_language_code)
+            else:
+                return "I'd love to create a personalized meal plan for you! First, let me get to know you better. Would you like to set up your profile? Just say 'yes' and I'll ask you a few quick questions."
+        
+        # Use smart search functionality with personalization (inherits ALL previous features)
+        response = self.smart_search_chat(user_input, target_language_code, auto_detect)
+        
+        # Enhance response with personalization if profile exists
+        if self.patient_profile and not any(word in response for word in ['emergency', 'call 911', 'hospital']):
+            # Add personal touches to non-emergency responses
+            name = self.patient_profile.get('name')
+            if name and len(response) > 100:  # Only for substantial responses
+                personal_prompt = f"""
+                Take this response and make it more personal for {name} who has {self.patient_profile.get('diabetes_type', 'diabetes')}:
+                
+                {response}
+                
+                Add personal touches like:
+                - Use their name naturally (don't overuse it)
+                - Reference their diabetes type when relevant
+                - Make it feel like advice from a friend who knows them
+                
+                Keep all the medical accuracy and disclaimers. Just make it more personal and warm.
+                """
+                
+                try:
+                    personalized_response = self.call_bedrock_model(
+                        personal_prompt, 
+                        conversation_type="medical",
+                        temperature=0.4
+                    )
+                    return personalized_response
+                except:
+                    # Fallback to original response if personalization fails
+                    pass
+        
+        return response
+    
+    def generate_semi_personalized_response(self, user_input, target_language_code):
+        """Generate response with partial profile data"""
+        profile = self.patient_profile
+        available_info = {k: v for k, v in profile.items() if v is not None}
+        
+        response_prompt = f"""
+        Create a diabetes response using this partial patient information:
+        
+        Available Patient Data:
+        {json.dumps(available_info, indent=2)}
+        
+        User Request: {user_input}
+        
+        Provide helpful advice that incorporates what we know about the patient while being clear about what additional information would help give even better guidance.
         """
         
-        response = self.call_bedrock_model(prompt)
+        response = self.call_bedrock_model(response_prompt, conversation_type="medical")
         
-        # Offer to complete profile
-        completion_offer = """
+        # Add offer to complete profile
+        completion_offer = f"\n\n💡 **Want even better personalized advice?** I notice I'm missing some details about your preferences and goals. Would you like to complete your profile? Just say 'complete my profile'!"
         
-        💡 **Want even better personalization?** I notice your profile is missing some details that could help me create an even more tailored plan. 
-        
-        Would you like me to ask a few quick questions to complete your profile? This will help me give you better recommendations in the future!
-        
-        Say "complete my profile" if you'd like to do that! 📋
-        """
+        if target_language_code != 'en':
+            response = self.enhance_medical_translation(response, target_language_code)
+            completion_offer = self.translate_response(completion_offer, target_language_code)
         
         return response + completion_offer
 
-# Demo patient data setup
 def setup_demo_patient():
-    """Set up a demo patient for testing"""
+    """Set up demo patient for testing"""
     db = PatientDatabase()
-    conn = sqlite3.connect(db.db_path)
-    cursor = conn.cursor()
     
-    # Insert demo patient
-    cursor.execute('''
-        INSERT OR REPLACE INTO patient_profile 
-        (patient_id, name, age, diabetes_type, hba1c, target_glucose_min, target_glucose_max, 
-         weight, activity_level, dietary_restrictions, language_preference)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', ('demo_patient_1', 'Sarah Johnson', 34, 'Type 2', 7.2, 80, 130, 68.5, 'Moderate', 'Vegetarian', 'en'))
+    demo_data = {
+        'patient_id': 'demo_patient_personalized',
+        'name': 'Sarah Johnson', 
+        'age': 34,
+        'diabetes_type': 'Type 2',
+        'hba1c': 7.2,
+        'target_glucose_min': 80,
+        'target_glucose_max': 130,
+        'weight': 68.5,
+        'activity_level': 'Moderate',
+        'dietary_restrictions': 'Vegetarian',
+        'language_preference': 'en'
+    }
     
-    # Insert demo medications
-    cursor.execute('''
-        INSERT OR REPLACE INTO medications 
-        (patient_id, medication_name, dosage, frequency, time_slots)
-        VALUES (?, ?, ?, ?, ?)
-    ''', ('demo_patient_1', 'Metformin', '500mg', 'Twice daily', '["08:00", "20:00"]'))
-    
-    # Insert demo meal preferences
-    cursor.execute('''
-        INSERT OR REPLACE INTO meal_preferences
-        (patient_id, preferred_foods, cultural_preferences, budget_range, cooking_skills)
-        VALUES (?, ?, ?, ?, ?)
-    ''', ('demo_patient_1', 'Mediterranean foods, quinoa, salmon', 'Mediterranean', 'Moderate', 'Intermediate'))
-    
-    # Insert demo glucose readings
-    for i in range(5):
-        reading = 95 + i * 5  # Sample readings
-        timestamp = datetime.now() - timedelta(days=i)
-        cursor.execute('''
-            INSERT INTO glucose_readings (patient_id, reading, timestamp, meal_context)
-            VALUES (?, ?, ?, ?)
-        ''', ('demo_patient_1', reading, timestamp, 'Before breakfast'))
-    
-    conn.commit()
-    conn.close()
-    print("✅ Demo patient data created!")
+    success = db.save_patient_profile(demo_data)
+    if success:
+        print("✅ Demo patient profile created successfully!")
+    return 'demo_patient_personalized'
 
 def main():
-    print("🏥 PersonalizedGlucoMate - Your AI Diabetes Companion")
-    print("💡 Now with personalized meal plans, medication reminders, and patient data!")
+    """Demo of Level 5 - Personalized GlucoMate"""
+    print("👤 GlucoMate Level 5: Personalized Diabetes Care")
+    print("🎯 Now with patient profiles, medication reminders, and tailored advice!")
+    print("\n✨ New Features:")
+    print("   • Personal patient profiles and data storage")
+    print("   • Medication reminder system")
+    print("   • Personalized meal plans and advice")
+    print("   • Tailored responses based on diabetes type, age, and preferences")
+    print("   • All previous features (multilingual, knowledge base, smart search)")
     
-    # Setup demo patient data
-    setup_demo_patient()
+    # Set up demo patient
+    demo_patient_id = setup_demo_patient()
     
-    # Initialize with demo patient
-    bot = PersonalizedGlucoMate(patient_id='demo_patient_1')
+    bot = PersonalizedGlucoMate(patient_id=demo_patient_id)
     
-    print(f"\n🌍 Available languages:")
-    for key, (lang_name, lang_code) in bot.supported_languages.items():
-        print(f"{key}. {lang_name}")
+    # Show personalization info
+    if bot.patient_profile:
+        profile = bot.patient_profile
+        print(f"\n👤 Patient Profile Loaded:")
+        print(f"   • Name: {profile.get('name', 'Not set')}")
+        print(f"   • Diabetes Type: {profile.get('diabetes_type', 'Not set')}")
+        print(f"   • Age: {profile.get('age', 'Not set')}")
+        print(f"   • Target Range: {profile.get('target_glucose_min', 80)}-{profile.get('target_glucose_max', 130)} mg/dL")
+        print(f"   • Activity Level: {profile.get('activity_level', 'Not set')}")
     
-    print(f"\n💫 Try these personalized features:")
-    print("- 'Generate a meal plan for me'")
-    print("- 'What should I eat based on my recent glucose levels?'") 
-    print("- 'How are my glucose readings looking?'")
-    print("- 'What's my target range again?'")
-    print("- Regular diabetes questions work too!")
+    # Language selection (inherited)
+    language_name, language_code = bot.get_language_choice()
     
-    print(f"\n💬 Start chatting! (Type 'bye' to exit)")
+    # Personalized greeting
+    if bot.patient_profile:
+        name = bot.patient_profile.get('name', 'there')
+        diabetes_type = bot.patient_profile.get('diabetes_type', 'diabetes')
+        greeting = f"Hello {name}! I'm here to help you manage your {diabetes_type} with personalized care."
+    else:
+        greeting = bot.get_cultural_greeting(language_code)
+    
+    if language_code != 'en':
+        greeting = bot.translate_response(greeting, language_code)
+    
+    print(f"\n💙 {greeting}")
+    
+    # Personalized suggestions
+    personal_suggestions = [
+        "Create a meal plan for me",
+        "How are my glucose levels looking?", 
+        "What exercise is best for my diabetes type?",
+        "Remind me about my medications",
+        "Update my profile"
+    ]
+    
+    print(f"\n💡 Try these personalized features:")
+    for suggestion in personal_suggestions[:3]:
+        if language_code != 'en':
+            translated = bot.translate_response(suggestion, language_code)
+            print(f"   • {translated}")
+        else:
+            print(f"   • {suggestion}")
+    
+    exit_instruction = "Type 'quit' to exit"
+    if language_code != 'en':
+        exit_instruction = bot.translate_response(exit_instruction, language_code)
+    print(f"\n{exit_instruction}")
     
     try:
         while True:
-            user_input = input("\n😊 You: ").strip()
+            user_input = input(f"\n😊 You: ").strip()
             
-            if user_input.lower() in ['quit', 'exit', 'bye', 'goodbye', 'stop']:
-                bot.conversation_active = False
-                print(f"\n💙 GlucoMate: Take care, {bot.patient_profile.get('name', 'there')}! Keep up the great work managing your diabetes. See you soon! 🌟")
+            if bot.handle_exit_commands(user_input, language_code):
+                if bot.patient_profile:
+                    name = bot.patient_profile.get('name', 'there')
+                    farewell = f"Take care, {name}! Keep up the great work managing your diabetes. I'll be here whenever you need personalized support! 🌟"
+                else:
+                    farewell = bot.get_cultural_farewell(language_code)
+                
+                if language_code != 'en':
+                    farewell = bot.translate_response(farewell, language_code)
+                print(f"\n💙 GlucoMate: {farewell}")
                 break
             
             if user_input:
-                response = bot.personalized_chat(user_input, 'en')
-                print(f"\n💙 GlucoMate: {response}")
-                print("\n" + "─" * 50)
+                response = bot.personalized_chat(user_input, language_code)
+                print(f"\n👤 GlucoMate: {response}")
+                print("\n" + "─" * 60)
             else:
-                print("😊 I'm here whenever you're ready to chat!")
+                ready_msg = "I'm here with personalized care whenever you need me!"
+                if language_code != 'en':
+                    ready_msg = bot.translate_response(ready_msg, language_code)
+                print(f"💭 {ready_msg}")
                 
     except KeyboardInterrupt:
-        print(f"\n\n💙 GlucoMate: Take care! Keep monitoring your health! 🌟")
+        if bot.patient_profile:
+            name = bot.patient_profile.get('name', 'there')
+            farewell = f"Take care, {name}! 🌟"
+        else:
+            farewell = "Take care! 🌟"
+        print(f"\n\n💙 GlucoMate: {farewell}")
+    except Exception as e:
+        print(f"\n❌ An unexpected error occurred: {e}")
+    finally:
+        bot.conversation_active = False
 
 if __name__ == "__main__":
     main()
